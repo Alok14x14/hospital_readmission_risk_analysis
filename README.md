@@ -1,5 +1,3 @@
-# hospital_readmission_risk_analysis
-
 # <p align="center">Hospital Readmission Risk Analysis</p>
 # <p align="center">![Pic](https://cdn-icons-png.flaticon.com/512/1802/1802511.png)</p>
 
