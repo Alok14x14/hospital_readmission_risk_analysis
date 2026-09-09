@@ -1,7 +1,14 @@
+-- ============================================================
+-- HOSPITAL READMISSION RISK ANALYSIS
+-- Dataset: Diabetes 130-US Hospitals (1999-2008), UCI ML Repository
+-- Goal: Identify which patients/conditions drive 30-day readmission risk
+-- ============================================================
 
 CREATE DATABASE hospital_readmissions;
 USE hospital_readmissions;
 
+-- Quick sanity checks: confirm the raw table loaded correctly and
+-- get a feel for the columns before doing any cleaning.
 SELECT COUNT(*)
 FROM diabetic_data_raw;
 
@@ -9,13 +16,25 @@ SELECT * FROM
 diabetic_data_raw
 LIMIT 10;
 
+-- ============================================================
 -- DATA CLEANING
+-- ============================================================
 
--- STEP 1
+-- STEP 1: Standardize missing values
+-- The raw dataset encodes missing data as the string '?' instead of
+-- a real SQL NULL. That breaks aggregate functions like COUNT(),
+-- AVG(), and IS NULL checks, which all silently ignore '?' as if it
+-- were valid data. Converting '?' to NULL makes missingness explicit
+-- and lets built-in NULL-handling functions work correctly downstream.
 
+-- diag_1 was originally typed too narrow for some ICD-9 codes;
+-- widen it before writing any diagnosis codes into it.
 ALTER TABLE diabetic_data_raw
     MODIFY diag_1 VARCHAR(10);
-    
+
+-- MySQL blocks UPDATEs without a key-based WHERE clause by default
+-- (safe update mode). We're intentionally updating every row here,
+-- so we disable that guardrail just for this operation.
 SET SQL_SAFE_UPDATES = 0
 
 UPDATE diabetic_data_raw
@@ -29,6 +48,10 @@ SET race = NULLIF(race, '?'),
     
 -- optional: SET SQL_SAFE_UPDATES = 1
 
+-- Quantify how much of each column is actually missing now that '?'
+-- has been converted to NULL. This determines whether a column is
+-- usable, needs imputation, or should be dropped entirely (see below:
+-- weight/payer_code/medical_specialty turn out to be too sparse to use).
 SELECT
 	ROUND(SUM(weight IS NULL)/COUNT(*) * 100, 1) AS pct_missing_weight, 
 	ROUND(SUM(payer_code IS NULL)/COUNT(*) * 100, 1) AS pct_missing_payer,
@@ -36,8 +59,12 @@ SELECT
 FROM diabetic_data_raw;
 
 
--- STEP 2
-
+-- STEP 2: Deduplicate to one encounter per patient
+-- The same patient_nbr can appear multiple times (repeat hospital
+-- visits). If left as-is, patients with many encounters would be
+-- overrepresented and skew readmission rates upward. Checking first
+-- how many patients have >1 encounter confirms this is a real issue
+-- worth handling, not just a theoretical one.
 SELECT
 	patient_nbr, 
     COUNT(*) as encounter_count
@@ -46,7 +73,13 @@ GROUP BY patient_nbr
 HAVING COUNT(*) > 1
 ORDER BY encounter_count DESC
 LIMIT 10;
-    
+
+-- Keep only each patient's FIRST encounter (lowest encounter_id).
+-- This gives one independent observation per patient, which is the
+-- standard way to avoid within-patient correlation biasing the
+-- analysis. A new deduplicated table is created rather than
+-- overwriting the raw table, so the original data stays intact for
+-- reference or re-processing.
 CREATE TABLE diabetic_data_dedup AS
 SELECT t.*
 FROM diabetic_data_raw as t
@@ -58,10 +91,16 @@ GROUP BY patient_nbr) first_enc
 ON t.patient_nbr = first_enc.patient_nbr
 AND t.encounter_id = first_enc.first_encounter;
 
+-- Confirm the dedup worked and see how many unique patients remain.
  SELECT COUNT(*) FROM diabetic_data_dedup 
   
--- STEP 3
-
+-- STEP 3: Remove encounters that can't be validly "readmitted"
+-- Patients who were discharged to hospice or who died can't be
+-- readmitted in the way the study defines risk — including them
+-- would artificially inflate the "not readmitted" denominator and
+-- distort every downstream rate calculation. First inspect discharge
+-- disposition volumes, then find the specific codes that mean
+-- hospice/expired/deceased, then remove those encounters.
 SELECT 
 	discharge_disposition_id, 
     COUNT(*) as encounter_count
@@ -72,12 +111,17 @@ ORDER BY encounter_count DESC;
 SELECT * FROM ids_mapping_raw
 WHERE description LIKE '%hospice%' OR description LIKE '%expired%' OR description LIKE '%deceased%';
     
--- 11, 13, 14, 19, 20, 21, 26
-
+-- 11, 13, 14, 19, 20, 21, 26 = hospice / expired / unknown-invalid codes
 DELETE FROM diabetic_data_dedup 
 WHERE discharge_disposition_id IN (11, 13, 14, 19, 20, 21, 26);
     
--- STEP 4
+-- STEP 4: Build lookup tables for coded IDs
+-- discharge_disposition_id and admission_source_id are integer codes,
+-- not human-readable text. The source ids_mapping_raw table mixes
+-- multiple code types together in one table, which is error-prone to
+-- join against. Splitting them into two clean, purpose-specific
+-- mapping tables makes later JOINs unambiguous and the output
+-- readable (e.g. "Discharged to home" instead of "1").
 SELECT * FROM ids_mapping_raw;
 
 
@@ -156,7 +200,12 @@ INSERT INTO admission_source_map (admission_source_id, description) VALUES
 SELECT * FROM discharge_disposition_map;
 SELECT * FROM admission_source_map;
 
--- STEP 5
+-- STEP 5: Convert age brackets into a usable numeric value
+-- age is stored as a text range like '[50-60)', which can't be
+-- averaged, grouped numerically, or plotted directly. Adding a
+-- numeric midpoint column (e.g. '[50-60)' -> 55) gives a continuous
+-- proxy for age that later queries can aggregate and order by,
+-- while still keeping the original bracket for readable grouping.
 SELECT * FROM diabetic_data_dedup
 LIMIT 50;
 
@@ -176,8 +225,16 @@ SET age_midpoint = CASE
     WHEN age = '[90-100)' THEN 95
 END;
 
+-- ============================================================
 -- EXPLORATORY ANALYSIS
+-- Establish baseline readmission rates before doing anything advanced,
+-- so later "high risk" claims have a benchmark to compare against.
+-- ============================================================
 
+-- Overall breakdown of the target variable: what fraction of
+-- encounters are readmitted <30 days, >30 days, or not at all.
+-- This baseline rate is the number every later subgroup rate gets
+-- compared to.
 SELECT
 	readmitted, 
     COUNT(*) as encounter_count, 
@@ -186,6 +243,9 @@ FROM diabetic_data_dedup
 GROUP BY readmitted
 ORDER BY encounter_count DESC;
 	
+-- Readmission rate by age bracket, ordered by the numeric midpoint
+-- (not alphabetically by the text label) so the trend across age is
+-- actually readable.
 SELECT
 	age, 
     age_midpoint, 
@@ -196,6 +256,9 @@ FROM diabetic_data_dedup
 GROUP BY age, age_midpoint
 ORDER BY age_midpoint;
 
+-- Readmission rate by admission type (emergency, elective, urgent,
+-- etc.), joining to the mapping table so the output shows readable
+-- labels instead of raw ID codes.
 SELECT
 	m.description as admission_type, 
     COUNT(*) as total_encounters, 
@@ -208,8 +271,15 @@ ORDER BY readmission_rate_pct DESC;
 
 
 
+-- ============================================================
 -- ADVANCED TECHNIQUES
+-- ============================================================
 
+-- Build a reusable "base" CTE that selects the core risk-relevant
+-- columns and derives a clean 0/1 flag for 30-day readmission
+-- (CASE WHEN...THEN 1 ELSE 0). Doing this once as a CTE means every
+-- later query can reference the same is_readmitted_30 definition
+-- instead of re-deriving it and risking inconsistent logic.
 WITH patient_risk_base AS (
 	SELECT
 		encounter_id, 
@@ -231,7 +301,12 @@ SELECT * FROM patient_risk_base
 LIMIT 20;
 
 
-
+-- RANK() ranks each patient's medication count WITHIN their age
+-- group (PARTITION BY age_midpoint), rather than across the whole
+-- population. This answers "who has the heaviest medication burden
+-- for their age?" rather than just "who takes the most medications
+-- overall" — a 30-year-old and an 80-year-old aren't comparable on
+-- raw medication count alone.
 WITH patient_risk_base AS (
 	SELECT 
 		encounter_id, age_midpoint, num_medications, readmitted, 
@@ -248,6 +323,12 @@ ORDER BY age_midpoint, med_rank_age_group
 LIMIT 200;
 
 
+-- NTILE(4) splits the entire patient population into 4 equal-sized
+-- groups (quartiles) ordered by number_inpatient (prior inpatient
+-- visits) descending. Unlike RANK, this guarantees evenly sized
+-- buckets — useful for operational triage, e.g. "flag quartile 1
+-- for extra discharge follow-up" regardless of how the underlying
+-- values are distributed.
 WITH patient_risk_base AS (
 	SELECT 
 		encounter_id, number_inpatient, readmitted, 
@@ -261,6 +342,11 @@ SELECT
 FROM patient_risk_base;
 
 
+-- Convert two continuous variables (medication count, diagnosis
+-- count) into business-readable risk tiers using CASE. Raw numbers
+-- like "14 medications" mean little to a non-technical audience;
+-- labeling it "Medium burden" makes the output usable by care teams
+-- without a data background.
 SELECT
 	encounter_id, 
     num_medications, 
@@ -278,6 +364,10 @@ FROM diabetic_data_dedup;
 
 
 
+-- diag_1 stores raw ICD-9 diagnosis codes as text, not category
+-- names. The comment block below documents the ICD-9 numeric ranges
+-- used to bucket diag_1 into clinically meaningful categories, since
+-- these boundaries aren't self-explanatory from the codes alone.
 -- diag_1 notes
 -- 390–459: Diseases of the circulatory system
 -- 460–519: Diseases of the respiratory system
@@ -285,6 +375,14 @@ FROM diabetic_data_dedup;
 -- 580–629: Diseases of the genitourinary system
 -- 800–999: Injury and poisoning
 
+-- Categorize each encounter's primary diagnosis into a clinical
+-- bucket (CAST + LEFT to pull the numeric ICD-9 prefix out of the
+-- text code and range-match it), then use a correlated subquery in
+-- HAVING to keep only categories whose readmission rate is ABOVE the
+-- population-wide average. The subquery must be correlated (i.e.
+-- recomputed against the CTE) rather than a one-time value, because
+-- HAVING evaluates it per group in the context of the same
+-- diag_categorized result set being aggregated.
 WITH diag_categorized AS (
 	SELECT
 		encounter_id, 
@@ -314,11 +412,19 @@ HAVING AVG(is_readmitted_30) > (
 ORDER BY readmission_rate_pct DESC;
 
 
+-- ============================================================
 -- KEY FINDINGS
+-- Each block below answers one specific business question raised
+-- during EDA, tying the SQL directly back to an actionable insight.
+-- ============================================================
 
 -- Finding 1. Top diagnosis categories driving readmission
--- Finding 2. Does a medication change at discharge affect readmission?
+-- (see the diag_categorized query above)
 
+-- Finding 2. Does a medication change at discharge affect readmission?
+-- Compares readmission rate for encounters where medication was
+-- changed ('Ch') vs not ('No') at discharge, to see if the
+-- intervention itself correlates with outcome.
 SELECT
 	`change`, 
     COUNT(*) as total_encounters,
@@ -328,7 +434,10 @@ GROUP BY `change`;
 
 
 -- Finding 3. Discharge disposition impact
-
+-- Joins to the discharge_disposition_map built earlier for readable
+-- labels, and filters to dispositions with >100 encounters (HAVING)
+-- so small, noisy categories don't produce misleadingly extreme
+-- rates from a handful of cases.
 SELECT
 	m.description as discharge_disposition, 
     COUNT(*) AS total_encounters, 
@@ -344,16 +453,13 @@ LIMIT 10;
 
 
 -- Finding 4. A1C testing and readmission
-
+-- Checks whether patients who received an A1C test (and its result)
+-- have different readmission rates than those who weren't tested,
+-- since this maps to a specific clinical recommendation in the
+-- original research behind this dataset.
 SELECT
 	A1Cresult, 
     COUNT(*) as total_encounters, 
 	ROUND(SUM(readmitted = '<30') / COUNT(*) * 100, 1) AS readmission_rate_pct
 FROM diabetic_data_dedup
 GROUP BY A1Cresult;
-
-
-
-
-
-
